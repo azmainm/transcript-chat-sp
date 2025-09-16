@@ -3,6 +3,8 @@ const { MongoClient } = require('mongodb');
 const OpenAI = require('openai');
 const { z } = require('zod');
 const { TranscriptRAG } = require('./langchain-rag');
+const { OpenAIEmbeddings } = require('@langchain/openai');
+const { MongoDBAtlasVectorSearch } = require('@langchain/mongodb');
 
 const router = express.Router();
 
@@ -11,9 +13,15 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const DATABASE_NAME = "standuptickets";
 const TRANSCRIPTS_COLLECTION = "transcripts";
 const CHAT_COLLECTION = "transcript-chat";
+const EMBEDDINGS_COLLECTION = "transcript_embeddings";
 
-// Initialize OpenAI
+// Initialize OpenAI and LangChain components
 const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const embeddings = new OpenAIEmbeddings({
+  model: "text-embedding-3-small",
   apiKey: process.env.OPENAI_API_KEY,
 });
 
@@ -30,6 +38,20 @@ async function getDatabase() {
     db = client.db(DATABASE_NAME);
   }
   return db;
+}
+
+/**
+ * Initialize Vector Store for retrieval
+ */
+async function getVectorStore() {
+  const database = await getDatabase();
+  
+  return new MongoDBAtlasVectorSearch(embeddings, {
+    collection: database.collection(EMBEDDINGS_COLLECTION),
+    indexName: "vector_index", // Vector search index name in MongoDB Atlas
+    textKey: "text",
+    embeddingKey: "embedding",
+  });
 }
 
 // Validation schemas using Zod
@@ -51,93 +73,157 @@ const ChatCloseSchema = z.object({
 });
 
 /**
- * Calculate cosine similarity between two vectors
+ * Search for all SP-XXX task references in transcripts
  */
-function cosineSimilarity(vecA, vecB) {
-  const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
-  const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
-  const magnitudeB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
-  return dotProduct / (magnitudeA * magnitudeB);
-}
-
-/**
- * Generate embedding for query
- */
-async function generateQueryEmbedding(query) {
-  try {
-    const response = await openai.embeddings.create({
-      model: 'text-embedding-ada-002',
-      input: query,
-    });
-    return response.data[0].embedding;
-  } catch (error) {
-    console.error('Error generating query embedding:', error);
-    throw error;
-  }
-}
-
-/**
- * Find similar content in transcripts using embeddings
- */
-async function findSimilarContent(queryEmbedding, transcriptIds, similarityThreshold = 0.7, maxResults = 5) {
+async function searchAllTaskReferences(transcriptIds) {
   try {
     const database = await getDatabase();
-    const collection = database.collection(TRANSCRIPTS_COLLECTION);
+    const embeddingsCollection = database.collection(EMBEDDINGS_COLLECTION);
     
-    // Find transcripts with embeddings
-    const { ObjectId } = require('mongodb');
-    const objectIds = transcriptIds.map(id => {
-      try {
-        return new ObjectId(id);
-      } catch {
-        return id;
+    // Broad regex to catch all SP-XXX variations
+    const taskPattern = /\b(?:sp|SP)[-\s]?\d+\b/;
+    
+    const taskQuery = {
+      "transcriptId": { $in: transcriptIds },  // LangChain flattens metadata fields
+      text: { $regex: taskPattern, $options: 'i' }
+    };
+    
+    const taskDocs = await embeddingsCollection.find(taskQuery).limit(20).toArray();
+    
+    return taskDocs.map(doc => ({
+      transcriptId: doc.transcriptId,  // LangChain flattens metadata fields
+      meetingId: doc.meetingId,
+      date: doc.date,
+      content: doc.text,
+      contentPreview: doc.text.substring(0, 500) + (doc.text.length > 500 ? '...' : ''),
+      chunkIndex: doc.chunkIndex || 0,
+      similarity: 0.95 // Very high similarity for task references
+    }));
+    
+  } catch (error) {
+    console.error('Error in task search:', error);
+    return [];
+  }
+}
+
+/**
+ * Search for keyword matches in addition to vector similarity
+ */
+async function searchKeywordContent(query, transcriptIds) {
+  try {
+    const database = await getDatabase();
+    const embeddingsCollection = database.collection(EMBEDDINGS_COLLECTION);
+    
+    // Check if query is asking about tasks (use synonyms)
+    const isTaskQuery = /\b(task|tasks|sp[-\s]?\d+|ticket|tickets|item|items|work|todo|assignment)\b/i.test(query);
+    
+    let searchQueries = [];
+    
+    // If asking about tasks, search broadly for SP patterns and task-related terms
+    if (isTaskQuery) {
+      // Search for SP-XXX patterns
+      searchQueries.push({
+        "transcriptId": { $in: transcriptIds },  // LangChain flattens metadata fields
+        text: { $regex: /\b(?:sp|SP)[-\s]?\d+\b/, $options: 'i' }
+      });
+      
+      // Search for task-related keywords
+      searchQueries.push({
+        "transcriptId": { $in: transcriptIds },  // LangChain flattens metadata fields
+        text: { $regex: /\b(task|ticket|item|assignment|todo|work|status|progress|update|complete|done|pending)\b/i }
+      });
+    }
+    
+    // Search for specific SP-XXX patterns mentioned in query
+    const spMatches = query.match(/\b(?:sp|SP)[-\s]?\d+\b/g) || [];
+    if (spMatches.length > 0) {
+      searchQueries.push({
+        "transcriptId": { $in: transcriptIds },  // LangChain flattens metadata fields
+        text: { $regex: spMatches.join('|'), $options: 'i' }
+      });
+    }
+    
+    // General keyword search
+    const searchTerms = query.toLowerCase().split(' ').filter(term => term.length > 2);
+    if (searchTerms.length > 0) {
+      searchQueries.push({
+        "transcriptId": { $in: transcriptIds },  // LangChain flattens metadata fields
+        text: { $regex: searchTerms.join('|'), $options: 'i' }
+      });
+    }
+    
+    if (searchQueries.length === 0) {
+      return [];
+    }
+    
+    // Execute all queries and combine results
+    const allResults = [];
+    for (const query of searchQueries) {
+      const docs = await embeddingsCollection.find(query).limit(10).toArray();
+      allResults.push(...docs);
+    }
+    
+    // Remove duplicates and format
+    const uniqueDocs = allResults.filter((doc, index, self) => 
+      index === self.findIndex(d => d._id.toString() === doc._id.toString())
+    );
+    
+    return uniqueDocs.slice(0, 15).map(doc => ({
+      transcriptId: doc.transcriptId,  // LangChain flattens metadata fields
+      meetingId: doc.meetingId,
+      date: doc.date,
+      content: doc.text,
+      contentPreview: doc.text.substring(0, 500) + (doc.text.length > 500 ? '...' : ''),
+      chunkIndex: doc.chunkIndex || 0,
+      similarity: 0.9 // High similarity for keyword matches
+    }));
+    
+  } catch (error) {
+    console.error('Error in keyword search:', error);
+    return [];
+  }
+}
+
+/**
+ * Search for similar content using vector store retriever
+ */
+async function searchSimilarContent(query, transcriptIds, maxResults = 5) {
+  try {
+    const vectorStore = await getVectorStore();
+    const retriever = vectorStore.asRetriever({
+      k: maxResults * 3, // Get more results to filter by transcript IDs
+      searchType: "similarity",
+      searchKwargs: {
+        filter: {
+          "metadata.transcriptId": { $in: transcriptIds }
+        }
       }
     });
     
-    const transcripts = await collection.find({
-      _id: { $in: objectIds },
-      embeddings: { $exists: true, $ne: null }
-    }).toArray();
+    // Use the retriever to find similar documents
+    const docs = await retriever.getRelevantDocuments(query);
     
-    const similarities = [];
-    
-    for (const transcript of transcripts) {
-      if (!transcript.embeddings || !Array.isArray(transcript.embeddings)) continue;
-      
-      const similarity = cosineSimilarity(queryEmbedding, transcript.embeddings);
-      
-      if (similarity >= similarityThreshold) {
-        // Parse transcript content
-        let transcriptContent = '';
-        try {
-          const transcriptData = JSON.parse(transcript.transcript_data);
-          transcriptContent = transcriptData.map(entry => `${entry.speaker}: ${entry.text}`).join('\n');
-        } catch (error) {
-          console.error('Error parsing transcript data:', error);
-          continue;
-        }
-        
-        similarities.push({
-          transcriptId: transcript._id,
-          meetingId: transcript.meeting_id,
-          date: transcript.date,
-          similarity,
-          content: transcriptContent,
-          contentPreview: transcriptContent.substring(0, 500) + (transcriptContent.length > 500 ? '...' : '')
-        });
-      }
-    }
-    
-    // Sort by similarity (highest first) and limit results
-    return similarities
-      .sort((a, b) => b.similarity - a.similarity)
+    // Filter by transcript IDs and format results
+    const filteredDocs = docs
+      .filter(doc => transcriptIds.includes(doc.metadata.transcriptId))
       .slice(0, maxResults);
-      
+    
+    return filteredDocs.map(doc => ({
+      transcriptId: doc.metadata.transcriptId,
+      meetingId: doc.metadata.meetingId,
+      date: doc.metadata.date,
+      content: doc.pageContent,
+      contentPreview: doc.pageContent.substring(0, 500) + (doc.pageContent.length > 500 ? '...' : ''),
+      chunkIndex: doc.metadata.chunkIndex || 0,
+      similarity: 0.8 // Placeholder - vector stores don't always return similarity scores
+    }));
+    
   } catch (error) {
-    console.error('Error finding similar content:', error);
+    console.error('Error searching similar content:', error);
     throw error;
   }
 }
+
 
 /**
  * Generate response using LangChain RAG
@@ -167,28 +253,68 @@ router.post('/message', async (req, res) => {
     const validatedData = ChatMessageSchema.parse(req.body);
     const { message, transcriptIds, chatId } = validatedData;
     
-    // Generate embedding for user query
-    console.log('Generating embedding for user query...');
-    const queryEmbedding = await generateQueryEmbedding(message);
+    // Check if this is a task-related query
+    const isTaskQuery = /\b(task|tasks|sp[-\s]?\d+|ticket|tickets|item|items|work|todo|assignment)\b/i.test(message);
     
-    // Find similar content in transcripts
-    console.log('Finding similar content in transcripts...');
-    const similarContent = await findSimilarContent(queryEmbedding, transcriptIds, 0.6, 3);
+    // Search for similar content using enhanced approach
+    console.log('Searching for similar content using hybrid approach...');
+    
+    let searchPromises = [
+      searchSimilarContent(message, transcriptIds, 5),
+      searchKeywordContent(message, transcriptIds)
+    ];
+    
+    // If asking about tasks, also search for all task references
+    if (isTaskQuery) {
+      console.log('Task-related query detected, searching for all SP-XXX references...');
+      searchPromises.push(searchAllTaskReferences(transcriptIds));
+    }
+    
+    const searchResults = await Promise.all(searchPromises);
+    const [vectorResults, keywordResults, taskResults = []] = searchResults;
+    
+    // Combine and deduplicate results, prioritizing task results for task queries
+    const combinedResults = isTaskQuery 
+      ? [...taskResults, ...keywordResults, ...vectorResults]
+      : [...keywordResults, ...vectorResults];
+      
+    const uniqueResults = combinedResults.filter((result, index, self) => 
+      index === self.findIndex(r => r.content === result.content)
+    );
+    
+    const similarContent = uniqueResults.slice(0, 15); // Take top 15 results for better coverage
     
     // Generate AI response using LangChain RAG
     console.log('Generating AI response with LangChain...');
     const aiResponse = await generateChatResponse(message, similarContent);
     
+    // Handle structured response from new RAG system
+    let responseText = '';
+    let confidence = 'medium';
+    let followUpQuestions = [];
+    
+    if (typeof aiResponse === 'object' && aiResponse.answer) {
+      responseText = aiResponse.answer;
+      confidence = aiResponse.confidence || 'medium';
+      followUpQuestions = aiResponse.follow_up_questions || [];
+    } else {
+      responseText = typeof aiResponse === 'string' ? aiResponse : 'I apologize, but I encountered an issue processing your request.';
+    }
+    
     res.json({
       success: true,
-      response: aiResponse,
+      response: responseText,
+      confidence: confidence,
+      followUpQuestions: followUpQuestions,
       sources: similarContent.map(item => ({
         meetingId: item.meetingId,
         date: item.date,
         similarity: item.similarity,
-        preview: item.contentPreview
+        preview: item.contentPreview,
+        chunkIndex: item.chunkIndex
       })),
-      contextUsed: similarContent.length > 0
+      contextUsed: similarContent.length > 0,
+      chunksRetrieved: similarContent.length
     });
     
   } catch (error) {

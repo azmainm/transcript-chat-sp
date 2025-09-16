@@ -2,6 +2,9 @@ const express = require('express');
 const { MongoClient } = require('mongodb');
 const OpenAI = require('openai');
 const crypto = require('crypto');
+const { OpenAIEmbeddings } = require('@langchain/openai');
+const { RecursiveCharacterTextSplitter } = require('langchain/text_splitter');
+const { MongoDBAtlasVectorSearch } = require('@langchain/mongodb');
 
 const router = express.Router();
 
@@ -12,10 +15,21 @@ const generationLocks = new Set();
 const MONGODB_URI = process.env.MONGODB_URI;
 const DATABASE_NAME = "standuptickets";
 const TRANSCRIPTS_COLLECTION = "transcripts";
+const EMBEDDINGS_COLLECTION = "transcript_embeddings";
 
-// Initialize OpenAI
+// Initialize OpenAI and LangChain components
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+});
+
+const embeddings = new OpenAIEmbeddings({
+  model: "text-embedding-3-small",
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const textSplitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 1000,
+  chunkOverlap: 200,
 });
 
 let client = null;
@@ -31,6 +45,20 @@ async function getDatabase() {
 }
 
 /**
+ * Initialize Vector Store for MongoDB Atlas Vector Search
+ */
+async function getVectorStore() {
+  const database = await getDatabase();
+  
+  return new MongoDBAtlasVectorSearch(embeddings, {
+    collection: database.collection(EMBEDDINGS_COLLECTION),
+    indexName: "vector_index", // Vector search index name in MongoDB Atlas
+    textKey: "text",
+    embeddingKey: "embedding",
+  });
+}
+
+/**
  * Generate hash for transcript content to detect changes
  */
 function generateContentHash(content) {
@@ -38,92 +66,81 @@ function generateContentHash(content) {
 }
 
 /**
- * Split text into chunks for embedding
+ * Process and store transcript chunks in vector database
  */
-function chunkText(text, maxTokens = 4000) {
-  const chunks = [];
-  const words = text.split(' ');
-  let currentChunk = '';
-  
-  for (const word of words) {
-    const testChunk = currentChunk + (currentChunk ? ' ' : '') + word;
-    // Rough token estimation: 1 token ≈ 4 characters
-    if (testChunk.length > maxTokens * 4) {
-      if (currentChunk) {
-        chunks.push(currentChunk);
-        currentChunk = word;
-      } else {
-        // Single word is too long, truncate it
-        chunks.push(word.substring(0, maxTokens * 4));
+async function processTranscriptToVectorStore(transcriptId, transcriptContent, meetingId, date) {
+  try {
+    const vectorStore = await getVectorStore();
+    
+    // Split text into chunks using LangChain
+    const chunks = await textSplitter.splitText(transcriptContent);
+    console.log(`Split transcript into ${chunks.length} chunks`);
+    
+    // Prepare documents for vector store
+    const documents = chunks.map((chunk, index) => ({
+      pageContent: chunk,
+      metadata: {
+        transcriptId: transcriptId,
+        meetingId: meetingId,
+        date: date,
+        chunkIndex: index,
+        chunkTotal: chunks.length,
+        contentHash: generateContentHash(transcriptContent),
+        createdAt: new Date().toISOString()
       }
-    } else {
-      currentChunk = testChunk;
-    }
+    }));
+    
+    // Store in vector database
+    await vectorStore.addDocuments(documents);
+    
+    console.log(`Stored ${documents.length} chunks in vector database for transcript ${transcriptId}`);
+    return {
+      chunksStored: documents.length,
+      model: "text-embedding-3-small"
+    };
+    
+  } catch (error) {
+    console.error('Error processing transcript to vector store:', error);
+    throw error;
   }
-  
-  if (currentChunk) {
-    chunks.push(currentChunk);
-  }
-  
-  return chunks;
 }
 
 /**
- * Generate embeddings for transcript content (with chunking for large content)
+ * Check if transcript already has embeddings in vector store
  */
-async function generateEmbedding(text) {
+async function checkExistingEmbeddings(transcriptId) {
   try {
-    // If text is small enough, generate single embedding
-    if (text.length <= 4000 * 4) {
-      const response = await openai.embeddings.create({
-        model: 'text-embedding-ada-002',
-        input: text,
-      });
-      
-      return response.data[0].embedding;
-    }
+    const database = await getDatabase();
+    const embeddingsCollection = database.collection(EMBEDDINGS_COLLECTION);
     
-    // For large text, chunk it and average the embeddings
-    const chunks = chunkText(text);
-    const embeddings = [];
+    const existingEmbeddings = await embeddingsCollection.findOne({
+      "transcriptId": transcriptId  // LangChain flattens metadata fields
+    });
     
-    console.log(`Text too large (${text.length} chars), splitting into ${chunks.length} chunks`);
+    const hasEmbeddings = !!existingEmbeddings;
     
-    for (let i = 0; i < chunks.length; i++) {
-      console.log(`Processing chunk ${i + 1}/${chunks.length}...`);
-      const response = await openai.embeddings.create({
-        model: 'text-embedding-ada-002',
-        input: chunks[i],
-      });
-      
-      embeddings.push(response.data[0].embedding);
-      
-      // Small delay to avoid rate limiting
-      if (i < chunks.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-    }
-    
-    // Average the embeddings
-    const dimensions = embeddings[0].length;
-    const avgEmbedding = new Array(dimensions).fill(0);
-    
-    for (const embedding of embeddings) {
-      for (let i = 0; i < dimensions; i++) {
-        avgEmbedding[i] += embedding[i];
-      }
-    }
-    
-    for (let i = 0; i < dimensions; i++) {
-      avgEmbedding[i] /= embeddings.length;
-    }
-    
-    console.log(`Generated averaged embedding from ${chunks.length} chunks`);
-    return avgEmbedding;
-    
+    return hasEmbeddings;
   } catch (error) {
-    console.error('Error generating embedding:', error);
-    throw error;
+    console.error('Error checking existing embeddings:', error);
+    return false;
+  }
+}
+
+/**
+ * Remove existing embeddings for a transcript
+ */
+async function removeExistingEmbeddings(transcriptId) {
+  try {
+    const database = await getDatabase();
+    const embeddingsCollection = database.collection(EMBEDDINGS_COLLECTION);
+    
+    const result = await embeddingsCollection.deleteMany({
+      "transcriptId": transcriptId  // LangChain flattens metadata fields
+    });
+    
+    console.log(`Removed ${result.deletedCount} existing embeddings for transcript ${transcriptId}`);
+  } catch (error) {
+    console.error('Error removing existing embeddings:', error);
   }
 }
 
@@ -158,17 +175,20 @@ router.get('/status', async (req, res) => {
       _id: { $in: objectIds }
     }).toArray();
     
-    const embeddingStatus = transcripts.map(transcript => {
-      const hasEmbedding = transcript.embeddings && Array.isArray(transcript.embeddings) && transcript.embeddings.length > 0;
+    // Check vector store for embeddings instead of transcript documents
+    const embeddingStatus = await Promise.all(transcripts.map(async (transcript) => {
+      // Ensure we're using the string version of the ObjectId for consistency
+      const transcriptIdString = transcript._id.toString();
+      const hasEmbedding = await checkExistingEmbeddings(transcriptIdString);
       
       return {
         _id: transcript._id,
         meeting_id: transcript.meeting_id,
         hasEmbedding,
-        embeddingMetadata: transcript.embeddingMetadata || null,
+        embeddingMetadata: hasEmbedding ? { model: "text-embedding-3-small", vectorStore: true } : null,
         contentLength: transcript.transcript_data ? transcript.transcript_data.length : 0
       };
-    });
+    }));
     
     const allHaveEmbeddings = embeddingStatus.every(status => status.hasEmbedding);
     const totalCount = embeddingStatus.length;
@@ -246,17 +266,21 @@ router.post('/generate', async (req, res) => {
           continue;
         }
         
-        // Check if embeddings already exist
-        if (transcript.embeddings && Array.isArray(transcript.embeddings) && transcript.embeddings.length > 0) {
+        // Check if embeddings already exist in vector store
+        const hasExistingEmbeddings = await checkExistingEmbeddings(transcriptId);
+        if (hasExistingEmbeddings) {
           results.push({
             transcriptId,
             status: 'skipped',
-            message: 'Embeddings already exist'
+            message: 'Embeddings already exist in vector store'
           });
           skipped++;
           generationLocks.delete(transcriptId); // Remove lock
           continue;
         }
+        
+        // Clean up any partial embeddings before creating new ones
+        await removeExistingEmbeddings(transcriptId);
         
         // Parse transcript data
         let transcriptContent;
@@ -290,26 +314,34 @@ router.post('/generate', async (req, res) => {
           continue;
         }
         
-        // Generate embedding
-        console.log(`Generating embedding for transcript ${transcriptId}...`);
-        const embedding = await generateEmbedding(transcriptContent);
+        // Process transcript and store in vector database
+        console.log(`Processing transcript ${transcriptId} to vector store...`);
+        const result = await processTranscriptToVectorStore(
+          transcriptId, 
+          transcriptContent, 
+          transcript.meeting_id, 
+          transcript.date
+        );
         
-        // Create metadata
+        // Update transcript with embedding metadata (backward compatibility)
         const embeddingMetadata = {
-          model: 'text-embedding-ada-002',
+          model: 'text-embedding-3-small',
           generatedAt: new Date().toISOString(),
           contentHash: generateContentHash(transcriptContent),
           contentLength: transcriptContent.length,
-          lastUpdated: new Date().toISOString()
+          lastUpdated: new Date().toISOString(),
+          vectorStore: true,
+          chunksStored: result.chunksStored
         };
         
-        // Update transcript with embedding
         await collection.updateOne(
           { _id: transcript._id },
           {
             $set: {
-              embeddings: embedding,
               embeddingMetadata: embeddingMetadata
+            },
+            $unset: {
+              embeddings: "" // Remove old averaged embeddings
             }
           }
         );
@@ -317,8 +349,9 @@ router.post('/generate', async (req, res) => {
         results.push({
           transcriptId,
           status: 'generated',
-          message: 'Embedding generated successfully',
-          embeddingDimensions: embedding.length,
+          message: 'Embeddings generated and stored in vector database',
+          chunksStored: result.chunksStored,
+          model: result.model,
           contentLength: transcriptContent.length
         });
         generated++;
