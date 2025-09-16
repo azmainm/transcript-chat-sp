@@ -256,11 +256,18 @@ router.post('/message', async (req, res) => {
     // Check if this is a task-related query
     const isTaskQuery = /\b(task|tasks|sp[-\s]?\d+|ticket|tickets|item|items|work|todo|assignment)\b/i.test(message);
     
+    // Check if this is a meeting-specific query (wanting separate analysis for each meeting)
+    const isMeetingSpecificQuery = /\b(each meeting|each transcript|separate|individual|per meeting|meeting.*separate|summary.*each|each.*summary)\b/i.test(message);
+    
     // Search for similar content using enhanced approach
     console.log('Searching for similar content using hybrid approach...');
     
+    // Adjust search parameters based on query type
+    const vectorResultsCount = isMeetingSpecificQuery ? 10 : 5; // Get more results for meeting-specific queries
+    const maxFinalResults = isMeetingSpecificQuery ? 25 : 15; // Allow more results for comprehensive meeting analysis
+    
     let searchPromises = [
-      searchSimilarContent(message, transcriptIds, 5),
+      searchSimilarContent(message, transcriptIds, vectorResultsCount),
       searchKeywordContent(message, transcriptIds)
     ];
     
@@ -268,6 +275,11 @@ router.post('/message', async (req, res) => {
     if (isTaskQuery) {
       console.log('Task-related query detected, searching for all SP-XXX references...');
       searchPromises.push(searchAllTaskReferences(transcriptIds));
+    }
+    
+    // If asking for meeting-specific information, log for debugging
+    if (isMeetingSpecificQuery) {
+      console.log('Meeting-specific query detected, retrieving comprehensive results for each transcript...');
     }
     
     const searchResults = await Promise.all(searchPromises);
@@ -282,10 +294,20 @@ router.post('/message', async (req, res) => {
       index === self.findIndex(r => r.content === result.content)
     );
     
-    const similarContent = uniqueResults.slice(0, 15); // Take top 15 results for better coverage
+    const similarContent = uniqueResults.slice(0, maxFinalResults); // Take appropriate number of results based on query type
     
     // Generate AI response using LangChain RAG
     console.log('Generating AI response with LangChain...');
+    const uniqueTranscripts = [...new Set(similarContent.map(item => item.transcriptId))];
+    const uniqueMeetings = [...new Set(similarContent.map(item => item.meetingId))];
+    
+    console.log(`Using ${similarContent.length} content chunks from ${uniqueTranscripts.length} unique transcripts across ${uniqueMeetings.length} meetings`);
+    
+    if (isMeetingSpecificQuery) {
+      console.log('Meeting-specific query - transcripts involved:', uniqueTranscripts);
+      console.log('Meetings involved:', uniqueMeetings);
+    }
+    
     const aiResponse = await generateChatResponse(message, similarContent);
     
     // Handle structured response from new RAG system
@@ -301,18 +323,54 @@ router.post('/message', async (req, res) => {
       responseText = typeof aiResponse === 'string' ? aiResponse : 'I apologize, but I encountered an issue processing your request.';
     }
     
+    // Extract unique transcript information for better client-side understanding
+    const uniqueTranscriptIds = [...new Set(similarContent.map(item => item.transcriptId))];
+    const transcriptDetails = uniqueTranscriptIds.map(transcriptId => {
+      const transcriptContent = similarContent.filter(item => item.transcriptId === transcriptId);
+      return {
+        transcriptId: transcriptId,
+        meetingId: transcriptContent[0]?.meetingId,
+        date: transcriptContent[0]?.date,
+        chunksUsed: transcriptContent.length
+      };
+    });
+    
+    // Also maintain meeting-level grouping for backward compatibility
+    const uniqueMeetingIds = [...new Set(similarContent.map(item => item.meetingId))];
+    const meetingDetails = uniqueMeetingIds.map(meetingId => {
+      const meetingContent = similarContent.filter(item => item.meetingId === meetingId);
+      const transcriptsInMeeting = [...new Set(meetingContent.map(item => item.transcriptId))];
+      return {
+        meetingId: meetingId,
+        date: meetingContent[0]?.date,
+        transcriptCount: transcriptsInMeeting.length,
+        chunksUsed: meetingContent.length
+      };
+    });
+
     res.json({
       success: true,
       response: responseText,
       confidence: confidence,
       followUpQuestions: followUpQuestions,
       sources: similarContent.map(item => ({
+        transcriptId: item.transcriptId,
         meetingId: item.meetingId,
         date: item.date,
         similarity: item.similarity,
         preview: item.contentPreview,
         chunkIndex: item.chunkIndex
       })),
+      transcriptAnalysis: {
+        totalTranscripts: uniqueTranscriptIds.length,
+        transcripts: transcriptDetails,
+        isTranscriptSpecific: isMeetingSpecificQuery
+      },
+      meetingAnalysis: {
+        totalMeetings: uniqueMeetingIds.length,
+        meetings: meetingDetails,
+        isMeetingSpecific: isMeetingSpecificQuery
+      },
       contextUsed: similarContent.length > 0,
       chunksRetrieved: similarContent.length
     });

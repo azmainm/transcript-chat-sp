@@ -36,6 +36,14 @@ Your role:
 - If you cannot find relevant information in the transcripts, clearly state that
 - Be conversational but professional in your responses
 
+CRITICAL: MULTI-TRANSCRIPT ANALYSIS
+- You may be analyzing content from MULTIPLE DIFFERENT MEETING DATES
+- Content is grouped by MEETING DATE in the format: === MEETING ON [DATE] ===
+- When users ask for information about "each meeting" or "separate summaries", you MUST analyze and respond for each unique DATE separately
+- IMPORTANT: Multiple transcripts from the same date should be treated as ONE MEETING - combine their content into a single analysis
+- When presenting information from multiple meeting dates, organize your response by DATE for clarity
+- If a user asks "give me a summary of each meeting", provide ONE summary per unique date, even if there are multiple transcript sources from that date
+
 Important Context Recognition:
 - TASKS and SP-XXX are INTERCHANGEABLE TERMS - when someone asks about "tasks", they want to know about SP-XXX items
 - Any reference to "SP-XXX", "SP XXX", "sp-XXX", "sp XXX" or similar patterns (where XXX is a number) refers to TASKS
@@ -48,12 +56,24 @@ Important Context Recognition:
 Guidelines:
 - Always base your responses on the provided transcript context
 - Quote specific parts of conversations when relevant
-- If asked about people, reference what they said or did in the meetings
-- If asked about decisions or action items, be specific about what was discussed
-- When discussing tasks, use the SP-XXX format and mention any relevant details from the transcript
-- When asked about "tasks" or "what tasks were discussed", scan through ALL the provided context and identify EVERY SP-XXX pattern mentioned
+- If asked about people, reference what they said or did in the meetings AND specify which meeting
+- If asked about decisions or action items, be specific about what was discussed AND in which meeting
+- When discussing tasks, use the SP-XXX format and mention any relevant details from the transcript AND which transcript discussed them
+- When asked about "tasks" or "what tasks were discussed", scan through ALL the provided context and identify EVERY SP-XXX pattern mentioned, organized by transcript ID
 - Be comprehensive - don't just mention one task if multiple SP-XXX items are referenced
+- When analyzing multiple transcripts, clearly separate your analysis by date
+- Use headers or clear organization when discussing multiple transcripts (e.g., "## Meeting on September 15, 2025")
 - If the question cannot be answered from the transcript content, say so clearly
+
+RESPONSE FORMAT FOR MULTIPLE TRANSCRIPTS:
+When you have content from multiple transcripts, structure your response like this:
+## Meeting on [DATE]
+[Analysis specific to this transcript]
+
+## Meeting on [DATE]  
+[Analysis specific to this transcript]
+
+Note: Use descriptive dates (e.g., "September 15, 2025" or "2025-09-15") instead of showing long transcript or meeting IDs to users.
 
 Please provide a helpful response based on the transcript content below.
 
@@ -124,20 +144,48 @@ Context from relevant transcript sections:
   }
 
   /**
-   * Format context from similar transcript sections
+   * Format context from similar transcript sections with enhanced transcript separation
    * @param {Array} similarContent - Array of similar content with metadata
-   * @returns {string} Formatted context string
+   * @returns {string} Formatted context string with clear transcript boundaries
    */
   formatContext(similarContent) {
     if (!similarContent || similarContent.length === 0) {
       return 'No relevant transcript content found for this query.';
     }
 
-    return similarContent.map((item, index) => {
+    // Group content by DATE for better user experience (users care about dates, not internal IDs)
+    const groupedByDate = {};
+    similarContent.forEach((item, index) => {
+      const dateKey = item.date;
+      if (!groupedByDate[dateKey]) {
+        groupedByDate[dateKey] = {
+          date: item.date,
+          transcripts: new Set(),
+          content: []
+        };
+      }
+      groupedByDate[dateKey].transcripts.add(item.transcriptId);
       const similarity = (item.similarity * 100).toFixed(1);
-      return `[Source ${index + 1}: Meeting ${item.meetingId} - ${item.date}] (Similarity: ${similarity}%)
-${item.content}`;
-    }).join('\n\n---\n\n');
+      groupedByDate[dateKey].content.push({
+        sourceNum: index + 1,
+        content: item.content,
+        similarity: similarity,
+        transcriptId: item.transcriptId
+      });
+    });
+
+    // Format grouped content with clear date separation (user-friendly)
+    const formattedSections = Object.values(groupedByDate).map(meeting => {
+      const header = `=== MEETING ON ${meeting.date} ===`;
+      const contentSections = meeting.content.map(section => 
+        `[Source ${section.sourceNum}] (Similarity: ${section.similarity}%)
+${section.content}`
+      ).join('\n\n');
+      
+      return `${header}\n${contentSections}`;
+    });
+
+    return formattedSections.join('\n\n' + '='.repeat(60) + '\n\n');
   }
 }
 
