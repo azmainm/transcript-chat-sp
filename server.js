@@ -43,7 +43,11 @@ async function initializeMongoDB() {
 
 // Middleware
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:3001'], // Allow admin panel and local testing
+  origin: [
+    'http://localhost:3000', 
+    'http://localhost:3001', 
+    'https://sherpaprompt-admin.vercel.app' // Allow production admin panel
+  ],
   credentials: true
 }));
 app.use(express.json({ limit: '10mb' }));
